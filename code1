@@ -1,0 +1,1382 @@
+# -*- coding: utf-8 -*-
+"""
+Elastic-net logistic regression for pulmonary embolism (PE) prediction
+======================================================================
+
+Primary validation : Harrell bootstrap optimism correction (entire pipeline repeated in every resample)
+Secondary          : stratified 70:30 split
+Hyper-parameters   : C and l1_ratio tuned by inner CV over prespecified grids (criterion: mean log loss)
+Calibration        : Platt (sigmoid), ensemble=False -> the final model reduces to ONE closed-form equation
+Comparators        : Wells and Revised Geneva scores recomputed from items using the published definitions
+
+Usage
+-----
+    python pe_elasticnet_analysis.py --input data.xlsx --output results/
+
+    # or via environment variables
+    PE_INPUT=data.xlsx PE_OUTPUT=results python pe_elasticnet_analysis.py
+
+    # smoke test (tiny number of resamples; never report these numbers)
+    python pe_elasticnet_analysis.py --input data.xlsx --quick
+
+Requirements
+------------
+    numpy pandas scipy statsmodels scikit-learn joblib matplotlib seaborn openpyxl
+    imbalanced-learn   (optional; enables the SMOTEN arm of the repeated-CV comparison)
+
+Input
+-----
+First sheet of an Excel workbook with the binary predictor columns listed in `predictor_columns`
+(Yes/No or 1/0; Sex: male = 1) and the outcome column `Final Diagnosis (PTE)` (CTPA result).
+Score columns already present in the workbook are NOT used; Wells and Geneva are recomputed.
+"""
+import argparse
+import atexit
+import datetime
+import io
+import json
+import os
+import platform
+import sys
+import time
+import warnings
+
+warnings.filterwarnings("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"  # inherited by joblib workers
+
+import matplotlib
+import numpy as np
+import pandas as pd
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+import sklearn
+import statsmodels.api as sm
+from joblib import Parallel, delayed
+from matplotlib.patches import FancyBboxPatch
+from scipy import stats
+from scipy.special import expit, logit
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, confusion_matrix, roc_auc_score, roc_curve
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import SplineTransformer, StandardScaler
+from statsmodels.stats.proportion import proportion_confint
+
+sns.set_theme(style="whitegrid")
+
+_SK = tuple(int(v) for v in sklearn.__version__.split(".")[:2])
+# sklearn >= 1.8 selects elastic-net through l1_ratio alone; older versions need penalty="elasticnet"
+LR_PENALTY_KW = {} if _SK >= (1, 8) else {"penalty": "elasticnet"}
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+_parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+_parser.add_argument("--input", default=os.environ.get("PE_INPUT"), help="Excel workbook (first sheet is read)")
+_parser.add_argument("--output", default=os.environ.get("PE_OUTPUT", "pe_analysis_outputs"), help="output directory")
+_parser.add_argument("--quick", action="store_true", default=os.environ.get("PE_QUICK", "0") == "1",
+                     help="smoke test with few resamples (do not report these numbers)")
+_args = _parser.parse_args()
+if not _args.input:
+    _parser.error("an input file is required (--input or PE_INPUT)")
+
+INPUT_FILE = _args.input
+OUTPUT_DIR = _args.output
+QUICK = _args.quick
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+RANDOM_STATE_SPLIT = 12
+RANDOM_STATE_MODEL = 42
+TEST_SIZE = 0.30
+N_JOBS = -1
+
+# Hyper-parameter search (prespecified grids, inner CV, mean fold log loss)
+TUNING_C_GRID = [0.01, 0.03, 0.10, 0.30, 1.00, 3.00, 10.00]
+TUNING_L1_GRID = [0.00, 0.25, 0.50, 0.75, 1.00]
+TUNING_INNER_FOLDS = 5
+TUNING_OUTER_FOLDS = 5
+USE_PLATT = True
+
+PRIMARY_THRESHOLD = 0.20                 # exploratory, sensitivity-oriented; NOT a rule-out threshold
+EXTRA_THRESHOLDS = [0.10, 0.15, 0.25, 0.30, 0.40]
+TARGET_SENSITIVITIES = [0.90, 0.95]      # thresholds derived on TRAINING out-of-fold predictions only
+
+N_BOOT_PRIMARY = 20 if QUICK else 2000   # optimism bootstrap, primary model
+N_BOOT_SENS = 10 if QUICK else 500       # optimism bootstrap, sensitivity scenario
+N_BOOT_CI = 50 if QUICK else 2000        # CIs of fixed held-out predictions
+N_BOOT_COEF = 20 if QUICK else 500       # coefficient stability (fixed final hyper-parameters)
+N_CV_REPEATS = 3 if QUICK else 20        # repeated CV (calibration / balancing comparison)
+N_OOF_REPEATS = 3 if QUICK else 10       # repeated nested CV for full-cohort predictions
+
+# Participant-flow numbers that are not in the analysis file (None -> "not recorded")
+N_ASSESSED_SUSPECTED_PE = None
+N_UNDERWENT_CTPA = None
+EXCLUSION_REASONS_TEXT = None
+
+# Raw continuous columns (optional). Leave {} if only dichotomised variables exist.
+# Format: {"<dichotomised column to replace>": "<raw column name in workbook>"}
+RAW_CONTINUOUS_COLUMNS = {}
+# Full Revised Geneva needs these three raw items; otherwise a PARTIAL exploratory score is used.
+GENEVA_RAW_COLUMNS = {"age_years": None, "heart_rate": None, "unilateral_limb_pain": None}
+
+# Optional centre column -> internal-external (leave-one-centre-out) validation
+CENTER_COLUMN = None
+
+# ---- Wells / Geneva reconstruction (published definitions) -----------------------------------
+# VERIFY with the data collectors:
+# True  : item 'An alternative diagnosis' = Yes means "PE judged MORE likely than alternatives" (3 points if Yes)
+# False : item = Yes means "alternative diagnosis more likely" (3 points if No)
+ALT_ITEM_YES_MEANS_PE_MORE_LIKELY = True
+WELLS_IMMOB_COLUMNS = ["Recently bedridden", "Recent surgery or immobilization"]
+WELLS_PREV_COLUMNS = ["Previous PE or DVT"]
+# Operating point reported for each rule in the threshold tables.
+# Wells: high = score > 6 (6.5 is attainable, so not ">= 7"); Geneva: high = score >= 11 (i.e. > 10).
+WELLS_TABLE_CUT = 6.0
+GENEVA_TABLE_CUT = 10.0
+WELLS_LOW_LT, WELLS_HIGH_GT = 2.0, 6.0      # low < 2, intermediate 2-6, high > 6
+GENEVA_INT_GT, GENEVA_HIGH_GT = 3.0, 10.0   # low 0-3, intermediate 4-10, high >= 11
+
+# ============================================================
+# 0. REPORT INFRASTRUCTURE (single markdown report + console log)
+# ============================================================
+REPORT_FILE = os.path.join(OUTPUT_DIR, "RESULTS_REPORT.md")
+CONSOLE_LOG_FILE = os.path.join(OUTPUT_DIR, "console_log.txt")
+CSV_APPENDIX_MAX_ROWS = 120
+_SKIP_IN_APPENDIX = ("bootstrap_optimism_draws_", "SUPPLEMENT_phi_correlation_matrix",
+                     "recomputed_scores_per_patient", "coef_bootstrap_draws")
+_T_START = time.time()
+_REPORT_PARTS, RUN_FILES = [], []
+_RUN_COMPLETE = False
+_console_buf = io.StringIO()
+
+
+class _Tee:
+    """Duplicate stdout into an in-memory buffer so the console log can be embedded in the report."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            try:
+                st.write(s)
+            except Exception:
+                pass
+        return len(s)
+
+    def flush(self):
+        for st in self.streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
+sys.stdout = _Tee(sys.__stdout__, _console_buf)
+
+
+def _fmt(v, d=4):
+    if isinstance(v, (float, np.floating)):
+        return "nan" if np.isnan(v) else f"{v:.{d}f}"
+    return str(v)
+
+
+def rep_h(title, level=2):
+    _REPORT_PARTS.append("\n" + "#" * level + " " + str(title) + "\n")
+
+
+def rep_text(text):
+    _REPORT_PARTS.append(str(text).strip("\n") + "\n")
+
+
+def rep_kv(d, title=None):
+    if title:
+        _REPORT_PARTS.append(f"**{title}**\n")
+    _REPORT_PARTS.append("\n".join(f"- {k}: {_fmt(v)}" for k, v in d.items()) + "\n")
+
+
+def rep_df(df, title=None, note=None, max_rows=None, decimals=4, index=False):
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+    if title:
+        _REPORT_PARTS.append(f"**{title}**\n")
+    if note:
+        _REPORT_PARTS.append(f"_{note}_\n")
+    shown = df if max_rows is None else df.head(max_rows)
+    txt = shown.round(decimals).to_string(index=index)
+    if max_rows is not None and len(df) > max_rows:
+        txt += f"\n... ({len(df) - max_rows} more rows truncated; see CSV)"
+    _REPORT_PARTS.append("```text\n" + txt + "\n```\n")
+
+
+def save_csv(df, name, index=False):
+    df.to_csv(os.path.join(OUTPUT_DIR, name), index=index)
+    RUN_FILES.append(name)
+
+
+def save_txt(name, text):
+    with open(os.path.join(OUTPUT_DIR, name), "w", encoding="utf-8") as fh:
+        fh.write(text)
+    RUN_FILES.append(name)
+
+
+def save_fig(name, dpi=600):
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, name), dpi=dpi, bbox_inches="tight")
+    plt.close()
+    RUN_FILES.append(name)
+
+
+def save_report():
+    """Write the consolidated markdown report (safe to call repeatedly / at exit)."""
+    try:
+        out = ["# PE elastic-net analysis - results\n",
+               f"Generated: {datetime.datetime.now():%Y-%m-%d %H:%M:%S} | runtime "
+               f"{(time.time() - _T_START) / 60:.1f} min | python {platform.python_version()} | "
+               f"numpy {np.__version__} | pandas {pd.__version__} | sklearn {sklearn.__version__}\n",
+               f"Input file: {os.path.basename(INPUT_FILE)}\n"]
+        if QUICK:
+            out.append("**WARNING: QUICK smoke-test mode. Do not use these numbers.**\n")
+        if not _RUN_COMPLETE:
+            out.append("**WARNING: run did not finish - partial report.**\n")
+        out.extend(_REPORT_PARTS)
+        out.append("\n\n---\n## Appendix A - Console log\n```text\n" + _console_buf.getvalue() + "\n```\n")
+        with open(CONSOLE_LOG_FILE, "w", encoding="utf-8") as fh:
+            fh.write(_console_buf.getvalue())
+        out.append("\n\n---\n## Appendix B - CSV files written in this run (truncated if long)\n")
+        for nm in sorted(n for n in RUN_FILES if n.endswith(".csv")):
+            fp = os.path.join(OUTPUT_DIR, nm)
+            if any(s in nm for s in _SKIP_IN_APPENDIX):
+                out.append(f"### {nm}\n(not embedded - large; see output folder)\n")
+                continue
+            try:
+                d = pd.read_csv(fp)
+                t = d.head(CSV_APPENDIX_MAX_ROWS).round(4).to_string(index=False)
+                if len(d) > CSV_APPENDIX_MAX_ROWS:
+                    t += f"\n... ({len(d) - CSV_APPENDIX_MAX_ROWS} more rows truncated)"
+                out.append(f"### {nm} ({d.shape[0]} x {d.shape[1]})\n```text\n{t}\n```\n")
+            except Exception as e:
+                out.append(f"### {nm}\n(could not read: {e})\n")
+        out.append("\n\n---\n## Appendix C - Files written in this run\n")
+        out.extend(f"- {n}" for n in sorted(set(RUN_FILES)))
+        with open(REPORT_FILE, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out) + "\n")
+        sys.__stdout__.write(f"\n[report] written: {REPORT_FILE}\n")
+    except Exception as e:
+        sys.__stdout__.write(f"\n[report] could not write report: {e}\n")
+
+
+atexit.register(save_report)
+
+rep_h("Step 1 - Configuration")
+rep_kv({
+    "Seeds (split / model)": f"{RANDOM_STATE_SPLIT} / {RANDOM_STATE_MODEL}", "Test fraction": TEST_SIZE,
+    "C grid": TUNING_C_GRID, "l1_ratio grid": TUNING_L1_GRID,
+    "Inner / outer folds": f"{TUNING_INNER_FOLDS} / {TUNING_OUTER_FOLDS}",
+    "Tuning criterion": "mean log loss across inner validation folds",
+    "Platt calibration": USE_PLATT, "Primary threshold": PRIMARY_THRESHOLD,
+    "Bootstrap reps primary / sensitivity / CI / coefficients":
+        f"{N_BOOT_PRIMARY} / {N_BOOT_SENS} / {N_BOOT_CI} / {N_BOOT_COEF}",
+    "Repeated-CV repeats / OOF repeats": f"{N_CV_REPEATS} / {N_OOF_REPEATS}",
+    "Wells coding: item=Yes means PE MORE likely": ALT_ITEM_YES_MEANS_PE_MORE_LIKELY,
+    "Wells immobilisation item": " OR ".join(WELLS_IMMOB_COLUMNS),
+    "Table operating points: Wells > / Geneva >": f"{WELLS_TABLE_CUT:g} / {GENEVA_TABLE_CUT:g}",
+    "QUICK mode": QUICK})
+
+# ============================================================
+# 2. COLUMN DEFINITIONS
+# ============================================================
+predictor_columns = [
+    "Over 50 years old", "Hemoptysis", "Pleuritic chest pain", "Dyspnea", "Syncope",
+    "Sudden onset of symptoms", "Active cancer", "Paralysis, paresis, or recent plaster immobilization",
+    "Recently bedridden", "Localized tenderness & deep venous system", "Entire leg swollen", "Calf swelling",
+    "PR>100", "RR>20", "SBP<100", "SpO2<95%", "evidence of a DVT", "Previous PE or DVT",
+    "Recent surgery or immobilization", "An alternative diagnosis", "copd history", "Wheezing",
+    "bronchospasm", "Bilateral rales", "temperature> 38.6°C", "Hormone use", "Normal bronchial sounds",
+    "(Rt lung: decreased respiratory sounds)", "(Lt lung: decreased respiratory sounds)",
+    "(Base: decreased respiratory sounds)", "(Bilateral lower limbs swelling)", "(Upper limb swelling)", "SEX"]
+BINARY_COLUMNS = predictor_columns.copy()
+base_columns = predictor_columns.copy()
+ALT = "An alternative diagnosis"
+PALP_TENDER, PALP_EDEMA = "Localized tenderness & deep venous system", "Entire leg swollen"
+outcome_column = "Final Diagnosis (PTE)"
+required_columns = predictor_columns + [outcome_column]
+
+# ============================================================
+# 3. LOAD AND CODE DATA
+# ============================================================
+df_raw = pd.read_excel(INPUT_FILE, sheet_name=0)
+missing_columns = [c for c in required_columns if c not in df_raw.columns]
+if missing_columns:
+    raise ValueError("Missing columns:\n" + "\n".join(missing_columns))
+
+raw_present = {k: v for k, v in RAW_CONTINUOUS_COLUMNS.items() if v in df_raw.columns}
+geneva_raw_present = {k: v for k, v in GENEVA_RAW_COLUMNS.items() if v and v in df_raw.columns}
+GENEVA_FULL = len(geneva_raw_present) == 3
+GENEVA_RAW_NAMES = list(geneva_raw_present.values()) if GENEVA_FULL else []
+extra_cols = list(raw_present.values()) + GENEVA_RAW_NAMES
+if CENTER_COLUMN and CENTER_COLUMN in df_raw.columns:
+    extra_cols.append(CENTER_COLUMN)
+df = df_raw[required_columns + extra_cols].copy()
+N_ROWS_IN_FILE = len(df)
+
+# descriptive only: pregnancy (not a predictor)
+preg_info = None
+if "Pregnancy" in df_raw.columns:
+    _pg = df_raw["Pregnancy"].astype(str).str.strip().str.lower().isin(["yes", "1", "true"])
+    preg_info = {"Pregnant, n": int(_pg.sum())}
+
+
+def convert_outcome(v):
+    s = str(v).strip().lower()
+    if s in ["yes", "1", "true", "positive", "pe", "pte"]:
+        return 1
+    if s in ["no", "0", "false", "negative", "none"]:
+        return 0
+    return np.nan
+
+
+def convert_binary(v):
+    if pd.isna(v):
+        return np.nan
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v) if v in [0, 1] else np.nan
+    s = str(v).strip().lower()
+    if s in ["yes", "y", "true", "1", "present", "positive", "male"]:
+        return 1.0
+    if s in ["no", "n", "false", "0", "absent", "negative", "female"]:
+        return 0.0
+    return np.nan
+
+
+df["PE"] = df[outcome_column].apply(convert_outcome)
+n_bad_outcome = int(df["PE"].isna().sum())
+orig_missing = {c: int(df[c].isna().sum()) for c in predictor_columns + GENEVA_RAW_NAMES}
+unrecognised = {}
+for col in BINARY_COLUMNS:
+    before = df[col].isna()
+    df[col] = df[col].apply(convert_binary)
+    unrecognised[col] = int((df[col].isna() & ~before).sum())
+for col in raw_present.values():
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+if GENEVA_FULL:
+    for k in ("age_years", "heart_rate"):
+        df[GENEVA_RAW_COLUMNS[k]] = pd.to_numeric(df[GENEVA_RAW_COLUMNS[k]], errors="coerce")
+    pc = GENEVA_RAW_COLUMNS["unilateral_limb_pain"]
+    b = df[pc].isna()
+    df[pc] = df[pc].apply(convert_binary)
+    unrecognised[pc] = int((df[pc].isna() & ~b).sum())
+
+rep_h("Steps 2-3 - Predictors, loading and coding")
+rep_text("All predictors (incl. Sex, male = 1) coded 1/0; outcome = final CTPA report (PE = 1). Wells and Geneva "
+         "scores are recomputed from items (Step 11); score columns in the workbook are never used.")
+rep_kv({"Rows in file": N_ROWS_IN_FILE, "Unrecognised outcome rows": n_bad_outcome,
+        "Candidate predictors (parameters)": len(predictor_columns),
+        "Raw continuous columns": list(raw_present.values()) or "none", **(preg_info or {})})
+rep_text("Predictors: " + "; ".join(predictor_columns))
+
+# ============================================================
+# 4. MISSING DATA, COMPLETE CASE, TABLE 1
+# ============================================================
+check_cols = predictor_columns + GENEVA_RAW_NAMES + ["PE"]
+miss_summary = pd.DataFrame({
+    "Variable": check_cols,
+    "Originally_empty_n": [orig_missing.get(c, n_bad_outcome) for c in check_cols],
+    "Unrecognised_value_n": [unrecognised.get(c, 0) for c in check_cols],
+    "Missing_total_n": [int(df[c].isna().sum()) for c in check_cols],
+    "Missing_percent": [100 * df[c].isna().mean() for c in check_cols]})
+save_csv(miss_summary, "missing_data_summary.csv")
+_mm = df[check_cols].isna()
+pattern_tab = (_mm.astype(int).astype(str).agg("".join, axis=1).loc[_mm.any(axis=1)]
+               .value_counts().rename_axis("pattern").reset_index(name="n"))
+save_csv(pattern_tab, "missing_data_patterns.csv")
+
+rows_complete = _mm.sum(axis=1) == 0
+n_excl_missing = int((~rows_complete).sum())
+df["Included"] = rows_complete.astype(int)
+df_analysis = df.loc[rows_complete].copy()
+cmp_rows = [{"Variable": c, "Included": g, "Prevalence_percent": 100 * s[c].mean()}
+            for c in BINARY_COLUMNS for g, s in df.groupby("Included")]
+save_csv(pd.DataFrame(cmp_rows), "included_vs_excluded_prevalence.csv")
+df_analysis[base_columns] = df_analysis[base_columns].astype(float)
+y_all = df_analysis["PE"].astype(int)
+yv = y_all.to_numpy()
+print(f"Rows in file {N_ROWS_IN_FILE} | excluded {n_excl_missing} | analysed {len(df_analysis)} | PE {yv.sum()}")
+
+rep_h("Step 4 - Missing data and participant flow")
+rep_text("Missingness was assessed on raw columns, then a complete-case filter was applied. Selection bias from the "
+         "complete-case analysis should be acknowledged; screening numbers upstream of the file are not in the dataset.")
+rep_kv({"Records in file": N_ROWS_IN_FILE, "Excluded (missing/unrecognised)": n_excl_missing,
+        "Analytic cohort": len(df_analysis), "PE": int(yv.sum()), "No PE": int((yv == 0).sum()),
+        "PE prevalence (%)": 100 * yv.mean(),
+        "Assessed for suspected PE": N_ASSESSED_SUSPECTED_PE if N_ASSESSED_SUSPECTED_PE is not None else "not recorded",
+        "Underwent CTPA": N_UNDERWENT_CTPA if N_UNDERWENT_CTPA is not None else "not recorded",
+        "Exclusion reasons": EXCLUSION_REASONS_TEXT or "not recorded"})
+if miss_summary["Missing_total_n"].sum() > 0:
+    rep_df(miss_summary[miss_summary["Missing_total_n"] > 0], "Variables with missing values")
+else:
+    rep_text("No candidate predictor or outcome had missing/unrecognised values in the supplied file.")
+
+t1 = []
+for c in base_columns:
+    x = df_analysis[c]
+    a, b = x[yv == 1], x[yv == 0]
+    tab = np.array([[(a == 1).sum(), (a == 0).sum()], [(b == 1).sum(), (b == 0).sum()]])
+    try:
+        chi = stats.chi2_contingency(tab)
+        use_f = chi[3].min() < 5
+        p = stats.fisher_exact(tab)[1] if use_f else chi[1]
+        test = "Fisher exact" if use_f else "Chi-square"
+    except Exception:
+        p, test = np.nan, "n/a"
+    t1.append({"Characteristic": c, "Overall n (%)": f"{int(x.sum())} ({100 * x.mean():.1f}%)",
+               "No PE n (%)": f"{int(b.sum())} ({100 * b.mean():.1f}%)",
+               "PE n (%)": f"{int(a.sum())} ({100 * a.mean():.1f}%)", "p_value": p, "Test": test})
+table1 = pd.DataFrame(t1)
+save_csv(table1, "Table1_baseline_characteristics.csv")
+rep_df(table1, "Table 1 - baseline characteristics (unadjusted p-values, 33 tests: interpret descriptively)")
+
+# ============================================================
+# 5. SAMPLE SIZE (Riley et al., BMJ 2020)
+# ============================================================
+
+
+def riley(P, prev, r2, shrink=0.90, margin=0.05):
+    max_r2 = 1 - np.exp(2 * (prev * np.log(prev) + (1 - prev) * np.log(1 - prev)))
+    n1 = P / ((shrink - 1) * np.log(1 - r2 / shrink))
+    s2 = r2 / (r2 + 0.05 * max_r2)
+    n2 = P / ((s2 - 1) * np.log(1 - r2 / s2))
+    n3 = (1.96 / margin) ** 2 * prev * (1 - prev)
+    return max_r2, n1, n2, n3
+
+
+def sample_size_table(P, n_total, n_events, extra=None):
+    prev = n_events / n_total
+    mr2 = riley(P, prev, 0.1)[0]
+    scen = [("15% of max R2cs (Riley default)", 0.15 * mr2), ("R2cs = 0.10", 0.10),
+            ("R2cs = 0.20", 0.20), ("R2cs = 0.30", 0.30)] + (extra or [])
+    rows = []
+    for lab, r2 in scen:
+        _, n1, n2, n3 = riley(P, prev, r2)
+        nreq = int(np.ceil(max(n1, n2, n3)))
+        rows.append({"Assumed_R2cs": lab, "R2cs": round(r2, 3), "P": P, "n_crit1_shrinkage": int(np.ceil(n1)),
+                     "n_crit2_optimism": int(np.ceil(n2)), "n_crit3_risk": int(np.ceil(n3)), "n_required": nreq,
+                     "n_available": n_total, "events_required": int(np.ceil(nreq * prev)),
+                     "events_available": n_events, "EPP_available": round(n_events / P, 2)})
+    return pd.DataFrame(rows)
+
+
+def cox_snell_r2(y, p):
+    y, p = np.asarray(y), np.clip(np.asarray(p, float), 1e-9, 1 - 1e-9)
+    ll_m = np.sum(y * np.log(p) + (1 - y) * np.log(1 - p))
+    pr = y.mean()
+    ll_0 = len(y) * (pr * np.log(pr) + (1 - pr) * np.log(1 - pr))
+    return 1 - np.exp(2 * (ll_0 - ll_m) / len(y))
+
+
+# ============================================================
+# 6. MODEL, TUNING, EQUATION
+# ============================================================
+
+
+def predict_prob(model, X):
+    return model.predict_proba(X)[:, 1]
+
+
+def build_base_model(spline_cols=(), C_value=1.0, l1_ratio=0.5, class_weight=None, random_state=RANDOM_STATE_MODEL):
+    steps = []
+    if spline_cols:
+        steps.append(("pre", ColumnTransformer(
+            [("spl", SplineTransformer(n_knots=4, degree=3, knots="quantile", include_bias=False),
+              list(spline_cols))], remainder="passthrough")))
+    steps += [("scaler", StandardScaler()),
+              ("lr", LogisticRegression(**LR_PENALTY_KW, solver="saga", l1_ratio=float(l1_ratio),
+                                        C=float(C_value), class_weight=class_weight, max_iter=5000,
+                                        random_state=random_state))]
+    return Pipeline(steps)
+
+
+def build_calibrated_model(spline_cols=(), C_value=1.0, l1_ratio=0.5, class_weight=None, platt=USE_PLATT):
+    base = build_base_model(spline_cols, C_value, l1_ratio, class_weight)
+    if not platt:
+        return base
+    return CalibratedClassifierCV(estimator=base, method="sigmoid", ensemble=False,
+                                  cv=StratifiedKFold(TUNING_INNER_FOLDS, shuffle=True,
+                                                     random_state=RANDOM_STATE_MODEL))
+
+
+def _logloss(y, p):
+    p = np.clip(p, 1e-15, 1 - 1e-15)
+    return -np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))
+
+
+def tune_hyperparameters(X, y, spline_cols=(), class_weight=None, n_splits=TUNING_INNER_FOLDS,
+                         seed=RANDOM_STATE_MODEL):
+    """Inner-CV grid search (mean fold log loss). Scaling/splines are refitted in every inner training fold.
+    Platt calibration is deliberately not part of the selection (it is fitted afterwards)."""
+    X = X.reset_index(drop=True)
+    y = np.asarray(y, dtype=int)
+    folds = list(StratifiedKFold(n_splits, shuffle=True, random_state=seed).split(X, y))
+    rows = []
+    for C in TUNING_C_GRID:
+        for l1 in TUNING_L1_GRID:
+            losses, aucs = [], []
+            for f, (tr, va) in enumerate(folds):
+                m = build_base_model(spline_cols, C, l1, class_weight, random_state=seed + f + 1)
+                try:
+                    m.fit(X.iloc[tr], y[tr])
+                    p = predict_prob(m, X.iloc[va])
+                    if not np.all(np.isfinite(p)):
+                        raise ValueError("non-finite")
+                    losses.append(_logloss(y[va], p))
+                    if len(np.unique(y[va])) == 2:
+                        aucs.append(roc_auc_score(y[va], p))
+                except Exception:
+                    losses.append(np.inf)
+            rows.append({"C": float(C), "l1_ratio": float(l1), "Mean_inner_log_loss": float(np.mean(losses)),
+                         "Mean_inner_AUC": float(np.mean(aucs)) if aucs else np.nan})
+    res = pd.DataFrame(rows).sort_values(["Mean_inner_log_loss", "C", "l1_ratio"]).reset_index(drop=True)
+    return {"C": float(res.loc[0, "C"]), "l1_ratio": float(res.loc[0, "l1_ratio"])}, res
+
+
+def fit_tuned_model(X, y, spline_cols=(), class_weight=None, seed=RANDOM_STATE_MODEL):
+    best, tab = tune_hyperparameters(X, y, spline_cols, class_weight, seed=seed)
+    m = build_calibrated_model(spline_cols, best["C"], best["l1_ratio"], class_weight)
+    m.fit(X, y)
+    return m, best, tab
+
+
+def nested_cv_oof_predictions(X, y, spline_cols=(), n_outer=TUNING_OUTER_FOLDS, seed=RANDOM_STATE_SPLIT):
+    """Out-of-fold predictions; hyper-parameters and Platt calibration are fitted inside each outer training fold."""
+    X = X.reset_index(drop=True)
+    y = np.asarray(y, dtype=int)
+    oof, recs = np.full(len(y), np.nan), []
+    for fold, (tr, va) in enumerate(StratifiedKFold(n_outer, shuffle=True, random_state=seed).split(X, y), 1):
+        best, _ = tune_hyperparameters(X.iloc[tr], y[tr], spline_cols, seed=seed + fold)
+        m = build_calibrated_model(spline_cols, best["C"], best["l1_ratio"])
+        m.fit(X.iloc[tr], y[tr])
+        oof[va] = predict_prob(m, X.iloc[va])
+        recs.append({"Outer_fold": fold, **best})
+    return oof, pd.DataFrame(recs)
+
+
+def extract_equation(cal_model, columns):
+    """Fold scaler + elastic-net + ONE Platt sigmoid into logit(p) = intercept + sum(beta_j * x_j) (0/1 coding)."""
+    if not hasattr(cal_model, "calibrated_classifiers_"):          # un-calibrated pipeline
+        sc, lr = cal_model.named_steps["scaler"], cal_model.named_steps["lr"]
+        w, b0, A, B = lr.coef_[0], float(lr.intercept_[0]), -1.0, 0.0
+    else:
+        cc = cal_model.calibrated_classifiers_[0]
+        pipe = getattr(cc, "estimator", None) or getattr(cc, "base_estimator")
+        sig = cc.calibrators[0]
+        A, B = float(sig.a_), float(sig.b_)                         # p = expit(-(A*f + B))
+        sc, lr = pipe.named_steps["scaler"], pipe.named_steps["lr"]
+        w, b0 = lr.coef_[0], float(lr.intercept_[0])
+    mu, sd = sc.mean_, sc.scale_
+    beta = -A * w / sd
+    intercept = -A * (b0 - np.sum(w * mu / sd)) - B
+    table = pd.DataFrame({"Predictor": columns, "Standardised_coef_before_Platt": w, "Scaler_mean": mu,
+                          "Scaler_SD": sd, "Final_coef_original_0/1_coding": beta,
+                          "Retained_(non-zero)": np.abs(w) > 1e-8})
+    return table, {"Intercept_final": intercept, "Base_model_intercept": b0, "Platt_A": A, "Platt_B": B}, intercept, beta
+
+
+# ============================================================
+# 7. METRICS
+# ============================================================
+
+
+def _clip(p):
+    return np.clip(np.asarray(p, float), 1e-6, 1 - 1e-6)
+
+
+def cal_slope_citl(y, p):
+    y, lp = np.asarray(y), logit(_clip(p))
+    try:
+        slope = sm.GLM(y, sm.add_constant(lp), family=sm.families.Binomial()).fit().params[1]
+        citl = sm.GLM(y, np.ones((len(y), 1)), family=sm.families.Binomial(), offset=lp).fit().params[0]
+    except Exception:
+        return np.nan, np.nan
+    return slope, citl
+
+
+def calibration_with_ci(y, p):
+    y, lp = np.asarray(y), logit(_clip(p))
+    mj = sm.GLM(y, sm.add_constant(lp), family=sm.families.Binomial()).fit()
+    mc = sm.GLM(y, np.ones((len(y), 1)), family=sm.families.Binomial(), offset=lp).fit()
+    cj, cc_ = mj.conf_int(), mc.conf_int()
+    return {"Calibration_slope": mj.params[1], "Slope_lo": cj[1][0], "Slope_hi": cj[1][1],
+            "CITL_intercept": mc.params[0], "CITL_lo": cc_[0][0], "CITL_hi": cc_[0][1],
+            "Joint_intercept": mj.params[0], "Joint_intercept_lo": cj[0][0], "Joint_intercept_hi": cj[0][1]}
+
+
+def counts_at_threshold(y, p, thr):
+    pred = (np.asarray(p) >= thr).astype(int)
+    tn, fp, fn, tp = confusion_matrix(np.asarray(y), pred, labels=[0, 1]).ravel()
+    return int(tn), int(fp), int(fn), int(tp)
+
+
+def rates(tn, fp, fn, tp):
+    d = lambda a, b: a / b if b > 0 else np.nan
+    return {"Sensitivity": d(tp, tp + fn), "Specificity": d(tn, tn + fp), "PPV": d(tp, tp + fp),
+            "NPV": d(tn, tn + fn), "Accuracy": d(tp + tn, tn + fp + fn + tp)}
+
+
+def threshold_row(y, p, thr, label=""):
+    tn, fp, fn, tp = counts_at_threshold(y, p, thr)
+    r = rates(tn, fp, fn, tp)
+    nums = {"Sensitivity": (tp, tp + fn), "Specificity": (tn, tn + fp), "PPV": (tp, tp + fp),
+            "NPV": (tn, tn + fn), "Accuracy": (tp + tn, tn + fp + fn + tp)}
+    row = {"Label": label, "Threshold": thr, "TN": tn, "FP": fp, "FN": fn, "TP": tp}
+    for k, (a, b) in nums.items():
+        lo, hi = proportion_confint(a, b, method="beta") if b > 0 else (np.nan, np.nan)
+        row[k], row[k + "_CI_lo"], row[k + "_CI_hi"] = r[k], lo, hi
+    return row
+
+
+def add_per1000(tab, prev):
+    """Translate sensitivity/specificity into events per 1000 CTPA-referred patients at the cohort prevalence."""
+    t = tab.copy()
+    t["Missed_PE_per_1000"] = 1000 * prev * (1 - t["Sensitivity"])
+    t["Missed_PE_per_1000_CI_hi"] = 1000 * prev * (1 - t["Sensitivity_CI_lo"])
+    t["Test_negative_per_1000"] = 1000 * (prev * (1 - t["Sensitivity"]) + (1 - prev) * t["Specificity"])
+    t["False_alarms_per_1000"] = 1000 * (1 - prev) * (1 - t["Specificity"])
+    return t
+
+
+def core_metrics(y, p, thr):
+    y = np.asarray(y)
+    slope, citl = cal_slope_citl(y, p)
+    r = rates(*counts_at_threshold(y, p, thr))
+    return {"AUC": roc_auc_score(y, p), "Brier": brier_score_loss(y, p), "Cal_slope": slope, "CITL": citl,
+            "Sensitivity": r["Sensitivity"], "Specificity": r["Specificity"]}
+
+
+def _midrank(x):
+    order = np.argsort(x)
+    z, n = x[order], len(x)
+    t, i = np.zeros(n), 0
+    while i < n:
+        j = i
+        while j < n and z[j] == z[i]:
+            j += 1
+        t[i:j] = 0.5 * (i + j - 1) + 1
+        i = j
+    out = np.empty(n)
+    out[order] = t
+    return out
+
+
+def delong_aucs_cov(y, preds):
+    y = np.asarray(y)
+    assert not np.isnan(np.vstack(preds).astype(float)).any(), "NaN in DeLong input"
+    order = np.argsort(-y, kind="stable")
+    P = np.vstack(preds)[:, order]
+    m = int(y.sum())
+    n = P.shape[1] - m
+    k = P.shape[0]
+    tx, ty, tz = np.empty((k, m)), np.empty((k, n)), np.empty((k, m + n))
+    for r in range(k):
+        tx[r], ty[r], tz[r] = _midrank(P[r, :m]), _midrank(P[r, m:]), _midrank(P[r])
+    aucs = tz[:, :m].sum(axis=1) / m / n - (m + 1.0) / 2.0 / n
+    v01, v10 = (tz[:, :m] - tx) / n, 1.0 - (tz[:, m:] - ty) / m
+    return aucs, np.atleast_2d(np.cov(v01)) / m + np.atleast_2d(np.cov(v10)) / n
+
+
+def delong_compare(y, a, b):
+    aucs, cov = delong_aucs_cov(y, [np.asarray(a), np.asarray(b)])
+    diff = aucs[0] - aucs[1]
+    se = np.sqrt(max(cov[0, 0] + cov[1, 1] - 2 * cov[0, 1], 1e-12))
+    z = diff / se
+    return {"AUC_A": aucs[0], "AUC_B": aucs[1], "Difference": diff, "Diff_CI_lo": diff - 1.96 * se,
+            "Diff_CI_hi": diff + 1.96 * se, "z": z, "p_value": 2 * (1 - stats.norm.cdf(abs(z)))}
+
+
+def delong_ci_single(y, p):
+    aucs, cov = delong_aucs_cov(y, [np.asarray(p)])
+    se = np.sqrt(cov[0, 0])
+    return aucs[0], max(aucs[0] - 1.96 * se, 0.0), min(aucs[0] + 1.96 * se, 1.0)
+
+
+def bootstrap_ci_fixed(y, p, thr, n_boot, seed=RANDOM_STATE_MODEL):
+    rng = np.random.default_rng(seed)
+    y, p = np.asarray(y), np.asarray(p)
+    vals = {k: [] for k in ["AUC", "Brier", "Sensitivity", "Specificity", "PPV", "NPV", "Accuracy"]}
+    for _ in range(n_boot):
+        idx = rng.integers(0, len(y), len(y))
+        yb, pb = y[idx], p[idx]
+        if len(np.unique(yb)) < 2:
+            continue
+        r = rates(*counts_at_threshold(yb, pb, thr))
+        vals["AUC"].append(roc_auc_score(yb, pb))
+        vals["Brier"].append(brier_score_loss(yb, pb))
+        for k in r:
+            vals[k].append(r[k])
+    return {k: (np.nanpercentile(v, 2.5), np.nanpercentile(v, 97.5)) for k, v in vals.items()}
+
+
+def binned_calibration(y, p, n_bins):
+    y, p = np.asarray(y), np.asarray(p)
+    q = pd.qcut(p, n_bins, duplicates="drop")
+    rows = []
+    for _, idx in pd.Series(np.arange(len(p))).groupby(q, observed=True):
+        i = idx.values
+        k, n = int(y[i].sum()), len(i)
+        lo, hi = proportion_confint(k, n, method="beta")
+        rows.append({"Mean_predicted": p[i].mean(), "Observed": k / n, "CI_lo": lo, "CI_hi": hi, "N": n})
+    return pd.DataFrame(rows)
+
+
+def net_benefit(y, p, thrs):
+    y, p, n = np.asarray(y), np.asarray(p), len(y)
+    nb = []
+    for t in thrs:
+        tn, fp, fn, tp = counts_at_threshold(y, p, t)
+        nb.append(tp / n - fp / n * t / (1 - t))
+    prev = y.mean()
+    return np.array(nb), prev - (1 - prev) * thrs / (1 - thrs)
+
+
+# ============================================================
+# 8. SCENARIOS
+# ============================================================
+scenarios = {"primary": dict(columns=list(base_columns), spline=[]),
+             "no_alt_dx": dict(columns=[c for c in base_columns if c != ALT], spline=[])}
+if raw_present:
+    cont = list(raw_present.values())
+    scenarios["continuous"] = dict(columns=[c for c in base_columns if c not in raw_present] + cont, spline=cont)
+    for c in cont:
+        df_analysis[c] = df.loc[df_analysis.index, c]
+else:
+    print("[info] No raw continuous columns: 'continuous' spline model skipped (variables are pre-dichotomised).")
+
+# ============================================================
+# 9. SECONDARY ANALYSIS: 70:30 SPLIT
+# ============================================================
+train_idx, test_idx = train_test_split(df_analysis.index, test_size=TEST_SIZE, stratify=y_all,
+                                       random_state=RANDOM_STATE_SPLIT)
+y_train, y_test = y_all.loc[train_idx], y_all.loc[test_idx]
+y_test_np = y_test.to_numpy()
+print(f"Train n={len(train_idx)} (PE {int(y_train.sum())}) | Test n={len(test_idx)} (PE {int(y_test.sum())})")
+
+rep_h("Step 9 - Secondary analysis: stratified 70:30 split")
+rep_text("Scaling, hyper-parameter selection and Platt calibration used the 70% development set only; the 30% held-out "
+         "set was used for evaluation only. The 0.20 threshold is an exploratory operating point, not a rule-out threshold.")
+rep_kv({"Train n / PE": f"{len(train_idx)} / {int(y_train.sum())}",
+        "Held-out n / PE": f"{len(test_idx)} / {int(y_test.sum())}",
+        "Held-out PE prevalence (%)": 100 * y_test.mean()})
+
+split_rows, split_models, split_probs = [], {}, {}
+for name, sc in scenarios.items():
+    cols = sc["columns"]
+    m, best, tab = fit_tuned_model(df_analysis.loc[train_idx, cols], y_train, sc["spline"])
+    p = predict_prob(m, df_analysis.loc[test_idx, cols])
+    split_models[name], split_probs[name] = m, p
+    save_csv(tab, f"tuning_grid_{name}_70_30.csv")
+    rep_kv(best, f"Selected hyper-parameters - {name} (70% development set)")
+    auc, lo, hi = delong_ci_single(y_test_np, p)
+    thr_r = threshold_row(y_test, p, PRIMARY_THRESHOLD)
+    split_rows.append({"Scenario": name, "N_predictors": len(cols), "AUC": auc, "AUC_CI_lo_DeLong": lo,
+                       "AUC_CI_hi_DeLong": hi, "Brier": brier_score_loss(y_test, p),
+                       **calibration_with_ci(y_test_np, p),
+                       **{k: v for k, v in thr_r.items() if k not in ("Label", "Threshold")}})
+split_table = pd.DataFrame(split_rows)
+save_csv(split_table, "split_70_30_all_scenarios.csv")
+rep_df(split_table, "70:30 held-out results, all scenarios at threshold 0.20")
+p_test = split_probs["primary"]
+
+# Platt vs none
+best_nc, tab_nc = tune_hyperparameters(df_analysis.loc[train_idx, base_columns], y_train)
+m_nc = build_base_model(C_value=best_nc["C"], l1_ratio=best_nc["l1_ratio"]).fit(
+    df_analysis.loc[train_idx, base_columns], y_train)
+p_nc = predict_prob(m_nc, df_analysis.loc[test_idx, base_columns])
+_cal_keys = ("Calibration_slope", "CITL_intercept")
+platt_cmp = pd.DataFrame([
+    {"Model": "Elastic-net, no Platt", "AUC": roc_auc_score(y_test, p_nc), "Brier": brier_score_loss(y_test, p_nc),
+     **{k: v for k, v in calibration_with_ci(y_test_np, p_nc).items() if k in _cal_keys}},
+    {"Model": "Elastic-net + Platt", "AUC": roc_auc_score(y_test, p_test), "Brier": brier_score_loss(y_test, p_test),
+     **{k: v for k, v in calibration_with_ci(y_test_np, p_test).items() if k in _cal_keys}}])
+save_csv(platt_cmp, "platt_vs_no_platt.csv")
+rep_df(platt_cmp, "Platt vs no Platt (held-out); see also repeated-CV comparison in Step 10b")
+
+primary_row = threshold_row(y_test, p_test, PRIMARY_THRESHOLD, "Exploratory 0.20")
+boot_ci = bootstrap_ci_fixed(y_test_np, p_test, PRIMARY_THRESHOLD, N_BOOT_CI)
+cal_ci = calibration_with_ci(y_test_np, p_test)
+save_csv(pd.DataFrame([{"Metric": k, "Lo": v[0], "Hi": v[1]} for k, v in boot_ci.items()]),
+         "split_bootstrap_CIs_threshold_020.csv")
+save_csv(pd.DataFrame([cal_ci]), "split_calibration_with_CI.csv")
+rep_kv({k: primary_row[k] for k in ("TN", "FP", "FN", "TP")}, "Held-out confusion matrix at 0.20")
+rep_df(pd.DataFrame([{"Metric": k, "Estimate": primary_row[k], "Exact_CI_lo": primary_row[k + "_CI_lo"],
+                      "Exact_CI_hi": primary_row[k + "_CI_hi"]}
+                     for k in ["Sensitivity", "Specificity", "PPV", "NPV", "Accuracy"]]),
+       "Threshold-specific measures (exact 95% CI)")
+rep_df(pd.DataFrame([{"Metric": k, "Boot_2.5%": v[0], "Boot_97.5%": v[1]} for k, v in boot_ci.items()]),
+       f"Percentile bootstrap CIs of fixed held-out predictions ({N_BOOT_CI} resamples)")
+rep_kv(cal_ci, "Held-out calibration (slope, CITL, joint intercept with 95% CI)")
+
+# Threshold table: fixed grid + thresholds derived from TRAINING nested-OOF predictions only
+thr_rows = [threshold_row(y_test, p_test, t, "Fixed grid")
+            for t in sorted(set([PRIMARY_THRESHOLD] + EXTRA_THRESHOLDS))]
+oof_tr, oof_tr_params = nested_cv_oof_predictions(df_analysis.loc[train_idx, base_columns], y_train,
+                                                  seed=RANDOM_STATE_SPLIT)
+save_csv(oof_tr_params, "threshold_derivation_selected_hyperparameters.csv")
+for target in TARGET_SENSITIVITIES:
+    ok = [t for t in np.unique(oof_tr)
+          if rates(*counts_at_threshold(y_train, oof_tr, t))["Sensitivity"] >= target]
+    t_star = max(ok) if ok else 0.0
+    thr_rows.append(threshold_row(y_test, p_test, t_star, f"Derived on training OOF for sens>={target:.2f}"))
+thr_table = add_per1000(pd.DataFrame(thr_rows), float(y_test.mean()))
+save_csv(thr_table, "threshold_table_with_exact_CIs.csv")
+rep_df(thr_table, "Held-out threshold table incl. missed PE / false alarms per 1000 (cohort prevalence)",
+       note="Every threshold with sensitivity < 100% misses PE; none of these estimates supports a rule-out claim.")
+
+# ---- sample size report (development set + full cohort)
+P = len(base_columns)
+ss_dev = sample_size_table(P, len(train_idx), int(y_train.sum()))
+ss_dev.insert(0, "Dataset", "70% development set")
+ss_all = sample_size_table(P, len(yv), int(yv.sum()))
+ss_all.insert(0, "Dataset", "Full cohort (bootstrap development)")
+
+# ============================================================
+# 10. PRIMARY INTERNAL VALIDATION: Harrell bootstrap optimism
+# ============================================================
+
+
+def _one_boot(seed, X, y, spline, thr):
+    rng = np.random.default_rng(seed)
+    n = len(y)
+    idx = rng.integers(0, n, n)
+    yb = y[idx]
+    if yb.sum() in (0, n):
+        return None
+    try:
+        Xb = X.iloc[idx].reset_index(drop=True)
+        best, _ = tune_hyperparameters(Xb, yb, spline, seed=seed)
+        m = build_calibrated_model(spline, best["C"], best["l1_ratio"])
+        m.fit(Xb, yb)
+        boot = core_metrics(yb, predict_prob(m, Xb), thr)
+        orig = core_metrics(y, predict_prob(m, X), thr)
+    except Exception:
+        return None
+    out = {k: boot[k] - orig[k] for k in boot}
+    out.update({"Selected_C": best["C"], "Selected_l1_ratio": best["l1_ratio"]})
+    return out
+
+
+def optimism_validation(name, n_boot):
+    sc = scenarios[name]
+    X = df_analysis[sc["columns"]].reset_index(drop=True)
+    m_full, best, tab = fit_tuned_model(X, yv, sc["spline"])
+    apparent = core_metrics(yv, predict_prob(m_full, X), PRIMARY_THRESHOLD)
+    save_csv(tab, f"tuning_grid_{name}_full_cohort.csv")
+    res = Parallel(n_jobs=N_JOBS)(delayed(_one_boot)(RANDOM_STATE_MODEL + i, X, yv, sc["spline"], PRIMARY_THRESHOLD)
+                                  for i in range(n_boot))
+    opt = pd.DataFrame([r for r in res if r is not None])
+    save_csv(opt, f"bootstrap_optimism_draws_{name}.csv")
+    rows = [{"Scenario": name, "Metric": k, "Apparent": apparent[k], "Mean_optimism": opt[k].mean(),
+             "Optimism_corrected": apparent[k] - opt[k].mean(),
+             "Approx_CI_lo": apparent[k] - opt[k].quantile(0.975),
+             "Approx_CI_hi": apparent[k] - opt[k].quantile(0.025),
+             "N_valid_bootstrap_reps": len(opt), "Final_selected_C": best["C"],
+             "Final_selected_l1_ratio": best["l1_ratio"]}
+            for k in ["AUC", "Brier", "Cal_slope", "CITL", "Sensitivity", "Specificity"]]
+    return pd.DataFrame(rows), best, opt
+
+
+boot_tables, boot_best, boot_draws = [], {}, {}
+for name in scenarios:
+    nb = N_BOOT_PRIMARY if name == "primary" else N_BOOT_SENS
+    print(f"\nBootstrap optimism validation: {name} ({nb} reps) ...")
+    t_, b_, o_ = optimism_validation(name, nb)
+    boot_tables.append(t_)
+    boot_best[name], boot_draws[name] = b_, o_
+boot_all = pd.concat(boot_tables, ignore_index=True)
+save_csv(boot_all, "bootstrap_optimism_corrected_all_scenarios.csv")
+print("\nOPTIMISM-CORRECTED PRIMARY RESULTS:\n", boot_all[boot_all.Scenario == "primary"].round(3).to_string())
+
+rep_h("Step 10 - Primary internal validation: Harrell bootstrap optimism correction")
+rep_text(f"In each of {N_BOOT_PRIMARY} bootstrap resamples ({N_BOOT_SENS} for the sensitivity scenarios) the complete "
+         "procedure was repeated: scaling, inner-CV tuning of C / l1_ratio, model fit and Platt calibration. Optimism = "
+         "performance in the bootstrap sample minus performance of the same model in the original cohort. "
+         "Optimism-corrected = apparent minus mean optimism. 'Approx CI' = apparent minus the 97.5/2.5 percentiles of "
+         "the optimism draws; it is an approximate interval for the corrected estimate, not a full bootstrap CI.")
+rep_df(boot_all[boot_all.Scenario == "primary"], "Optimism-corrected results - primary model")
+rep_df(boot_all[boot_all.Scenario != "primary"], "Optimism-corrected results - sensitivity scenario(s)")
+pd_ = boot_draws["primary"]
+sel = (pd_.groupby(["Selected_C", "Selected_l1_ratio"]).size().rename("n").reset_index()
+       .assign(Percent=lambda d: 100 * d["n"] / d["n"].sum()).sort_values("n", ascending=False))
+save_csv(sel, "bootstrap_hyperparameter_selection_frequency.csv")
+rep_df(sel.head(12), "Hyper-parameter selection frequency across bootstrap resamples",
+       note="A flat distribution means the data cannot discriminate between penalty settings. "
+            "If l1_ratio = 0 dominates, the final model is effectively ridge-penalised.")
+
+# ============================================================
+# 10b. REPEATED CV: Platt / class weights / SMOTEN (all steps in-fold)
+# ============================================================
+try:
+    from imblearn.over_sampling import SMOTEN
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    HAVE_IMB = True
+except Exception:
+    HAVE_IMB = False
+    print("[info] imbalanced-learn not installed: SMOTEN arm skipped (pip install imbalanced-learn)")
+
+
+def _tune_smoten(Xtr, ytr, seed):
+    Xtr, ytr = Xtr.reset_index(drop=True), np.asarray(ytr, dtype=int)
+    folds = list(StratifiedKFold(TUNING_INNER_FOLDS, shuffle=True, random_state=seed).split(Xtr, ytr))
+    rows = []
+    for C in TUNING_C_GRID:
+        for l1 in TUNING_L1_GRID:
+            ls = []
+            for f, (a, b) in enumerate(folds):
+                Xa, ya = SMOTEN(random_state=seed + f).fit_resample(Xtr.iloc[a], ytr[a])
+                mm = build_base_model(C_value=C, l1_ratio=l1, random_state=seed + f + 1).fit(Xa, ya)
+                ls.append(_logloss(ytr[b], predict_prob(mm, Xtr.iloc[b])))
+            rows.append({"C": C, "l1_ratio": l1, "loss": np.mean(ls)})
+    r = pd.DataFrame(rows).sort_values(["loss", "C", "l1_ratio"]).iloc[0]
+    return {"C": float(r["C"]), "l1_ratio": float(r["l1_ratio"])}
+
+
+def _cv_arm_model(name, Xtr, ytr, seed):
+    if name == "D_SMOTEN_in_fold":
+        best = _tune_smoten(Xtr, ytr, seed)
+        return ImbPipeline([("smote", SMOTEN(random_state=seed)), ("scaler", StandardScaler()),
+                            ("lr", LogisticRegression(**LR_PENALTY_KW, solver="saga", l1_ratio=best["l1_ratio"],
+                                                      C=best["C"], max_iter=5000, random_state=seed))]), best
+    cw = "balanced" if name == "C_class_weight_balanced" else None
+    best, _ = tune_hyperparameters(Xtr, ytr, class_weight=cw, seed=seed)
+    return build_calibrated_model((), best["C"], best["l1_ratio"], cw, platt=(name == "B_platt_PRIMARY")), best
+
+
+def _cv_repeat(rep, name, X, y):
+    oof, sel_ = np.zeros(len(y)), []
+    for fold, (tr, va) in enumerate(StratifiedKFold(5, shuffle=True, random_state=1000 + rep).split(X, y), 1):
+        m, best = _cv_arm_model(name, X.iloc[tr], y[tr], 1000 + rep * 100 + fold)
+        m.fit(X.iloc[tr], y[tr])
+        oof[va] = predict_prob(m, X.iloc[va])
+        sel_.append(best)
+    out = core_metrics(y, oof, PRIMARY_THRESHOLD)
+    out.update({"Mean_predicted_risk": float(oof.mean()), "Observed_prevalence": float(y.mean()), "Model": name,
+                "Repeat": rep, "Selected_C_median": float(np.median([s["C"] for s in sel_])),
+                "Selected_l1_median": float(np.median([s["l1_ratio"] for s in sel_]))})
+    return out
+
+
+cv_arms = ["A_plain_no_platt", "B_platt_PRIMARY", "C_class_weight_balanced"] + (["D_SMOTEN_in_fold"] if HAVE_IMB else [])
+X_cv = df_analysis[base_columns].astype(int)
+cv_long = pd.DataFrame(Parallel(n_jobs=N_JOBS)(
+    delayed(_cv_repeat)(r, n, X_cv, yv) for n in cv_arms for r in range(N_CV_REPEATS)))
+save_csv(cv_long, "repeated_cv_comparison_long.csv")
+cv_sum = cv_long.drop(columns="Repeat").groupby("Model").agg(["mean", "std"]).round(3)
+cv_sum.columns = ["_".join(c) for c in cv_sum.columns]
+save_csv(cv_sum.reset_index(), "repeated_cv_comparison_summary.csv")
+rep_h("Step 10b - Repeated 5-fold CV (tuning inside every training fold)")
+rep_text("A = no recalibration; B = Platt (primary); C = balanced class weights; D = in-fold SMOTEN. "
+         "Mean predicted risk far above the observed prevalence (C, D) indicates distorted probabilities.")
+rep_df(cv_sum.reset_index(), "Repeated-CV summary")
+
+# ============================================================
+# 11. WELLS AND GENEVA: one recomputed score each, published definitions
+# ============================================================
+d = df_analysis
+alt = d[ALT]
+t_alt = np.array([[((alt == 1) & (y_all == 1)).sum(), ((alt == 0) & (y_all == 1)).sum()],
+                  [((alt == 1) & (y_all == 0)).sum(), ((alt == 0) & (y_all == 0)).sum()]], float)
+alt_or, alt_p = (t_alt[0, 0] * t_alt[1, 1]) / (t_alt[0, 1] * t_alt[1, 0]), stats.fisher_exact(t_alt)[1]
+CODING_CONFLICT = (alt_or > 1) != ALT_ITEM_YES_MEANS_PE_MORE_LIKELY
+if CODING_CONFLICT:
+    print(f"[WARNING] '{ALT}' OR={alt_or:.2f} contradicts ALT_ITEM_YES_MEANS_PE_MORE_LIKELY="
+          f"{ALT_ITEM_YES_MEANS_PE_MORE_LIKELY}. Verify the item wording and who recorded it.")
+
+imm = (d[WELLS_IMMOB_COLUMNS].max(axis=1) > 0).astype(float)
+prv = (d[WELLS_PREV_COLUMNS].max(axis=1) > 0).astype(float)
+pe_more = alt if ALT_ITEM_YES_MEANS_PE_MORE_LIKELY else 1 - alt
+
+# Wells: DVT signs 3; PE more likely than alternative 3; HR>100 1.5; immobilisation/surgery 1.5;
+# previous PE/DVT 1.5; hemoptysis 1; malignancy 1.
+wells = (3.0 * d["evidence of a DVT"] + 3.0 * pe_more + 1.5 * d["PR>100"] + 1.5 * imm + 1.5 * prv
+         + 1.0 * d["Hemoptysis"] + 1.0 * d["Active cancer"])
+WELLS_NAME = WELLS_SHORT = "Wells score"
+
+# Revised Geneva (Le Gal 2006): age>=65 1; previous DVT/PE 3; surgery/fracture 2; cancer 2; unilateral limb pain 3;
+# hemoptysis 2; pain on deep palpation + unilateral edema 4; HR 75-94 3; HR>=95 5.
+palp = d[PALP_TENDER] * d[PALP_EDEMA]
+if GENEVA_FULL:
+    age_, hr_, pain_ = (d[GENEVA_RAW_COLUMNS[k]] for k in ("age_years", "heart_rate", "unilateral_limb_pain"))
+    geneva = (1.0 * (age_ >= 65) + 3.0 * prv + 2.0 * d["Recent surgery or immobilization"] + 2.0 * d["Active cancer"]
+              + 3.0 * pain_ + 2.0 * d["Hemoptysis"] + 4.0 * palp + 3.0 * ((hr_ >= 75) & (hr_ < 95))
+              + 5.0 * (hr_ >= 95)).astype(float)
+    GENEVA_NAME = GENEVA_SHORT = "Revised Geneva score"
+else:
+    # Not recorded: age >= 65 (only > 50 exists), heart-rate bands (only > 100 exists), unilateral limb pain.
+    geneva = (3.0 * prv + 2.0 * d["Recent surgery or immobilization"] + 2.0 * d["Active cancer"]
+              + 2.0 * d["Hemoptysis"] + 4.0 * palp + 5.0 * d["PR>100"]).astype(float)
+    GENEVA_NAME, GENEVA_SHORT = "Geneva score (partial, exploratory)", "Geneva (partial)"
+save_csv(pd.DataFrame({"Wells": wells, "Geneva": geneva, "PE": y_all}), "recomputed_scores_per_patient.csv", index=True)
+
+# ---- out-of-fold predictions for the full cohort (nested tuning, several repeats)
+print("\nRepeated nested-CV out-of-fold predictions ...")
+oof_res = Parallel(n_jobs=N_JOBS)(
+    delayed(nested_cv_oof_predictions)(df_analysis[base_columns], yv, (), TUNING_OUTER_FOLDS, 2000 + r)
+    for r in range(N_OOF_REPEATS))
+oof_list = [o for o, _ in oof_res]
+oof_single = oof_list[0]                   # used for DeLong / full-cohort threshold table (one honest CV repeat)
+oof_avg = np.mean(oof_list, axis=0)        # averaged: supplementary only (mildly optimistic)
+oof_auc = [roc_auc_score(yv, o) for o in oof_list]
+save_csv(pd.DataFrame({"AUC": oof_auc}).rename_axis("repeat").reset_index(), "oof_auc_per_repeat.csv")
+r2cv = cox_snell_r2(yv, oof_single)
+ss_obs = sample_size_table(P, len(yv), int(yv.sum()),
+                           extra=[("Observed R2cs of cross-validated predictions", r2cv)])
+ss_obs.insert(0, "Dataset", "Full cohort")
+sample_size_out = pd.concat([ss_dev, ss_all, ss_obs.tail(1)], ignore_index=True)
+save_csv(sample_size_out, "sample_size_assessment.csv")
+rep_h("Step 5 - Sample size / events per parameter (Riley et al., BMJ 2020, criteria 1-3)")
+rep_text(f"P = {P} candidate parameters. Criteria: shrinkage >= 0.90, optimism in Nagelkerke R2 <= 0.05, overall-risk "
+         f"margin 0.05. The last row uses the Cox-Snell R2 observed in cross-validated predictions "
+         f"(R2cs = {r2cv:.3f}), a lower bound of the true R2 because cross-validation attenuates fit.")
+rep_df(sample_size_out, "Sample-size assessment")
+
+# ---- AUC table and paired DeLong comparisons
+score_set = {WELLS_NAME: wells, GENEVA_NAME: geneva}
+auc_rows = []
+for nm, s in score_set.items():
+    af, lf, hf = delong_ci_single(yv, s.to_numpy())
+    ah, lh, hh = delong_ci_single(y_test_np, s.loc[test_idx].to_numpy())
+    auc_rows.append({"Score": nm, "AUC_full": af, "CI_lo": lf, "CI_hi": hf,
+                     "AUC_heldout": ah, "Held_lo": lh, "Held_hi": hh})
+af, lf, hf = delong_ci_single(yv, oof_single)
+auc_rows.append({"Score": "Elastic-net (CV repeat 1, full cohort)", "AUC_full": af, "CI_lo": lf, "CI_hi": hf})
+ah, lh, hh = delong_ci_single(y_test_np, p_test)
+auc_rows.append({"Score": "Elastic-net (70:30 held-out)", "AUC_heldout": ah, "Held_lo": lh, "Held_hi": hh})
+auc_table = pd.DataFrame(auc_rows)
+save_csv(auc_table, "score_auc_comparison.csv")
+
+dl_rows = []
+for nm, s in score_set.items():
+    dl_rows.append({"Population": "Full cohort (model = CV repeat 1)", "Comparator": nm,
+                    **delong_compare(yv, oof_single, s.to_numpy())})
+    dl_rows.append({"Population": "Held-out 30%", "Comparator": nm,
+                    **delong_compare(y_test_np, p_test, s.loc[test_idx].to_numpy())})
+dl = pd.DataFrame(dl_rows)
+save_csv(dl, "delong_paired_AUC_comparison.csv")
+
+# ---- Table 2: three-level categories vs observed PE prevalence
+ser = pd.Series(yv, index=df_analysis.index)
+
+
+def cat_row(score, lab, grp):
+    n, k = len(grp), int(grp.sum())
+    lo, hi = proportion_confint(k, n, method="beta") if n else (np.nan, np.nan)
+    return {"Score": score, "Category": lab, "N": n, "PE_n": k, "PE_%": 100 * k / n if n else np.nan,
+            "CI_lo_%": 100 * lo, "CI_hi_%": 100 * hi}
+
+
+wc = pd.cut(wells, [-np.inf, WELLS_LOW_LT - 0.25, WELLS_HIGH_GT, np.inf],
+            labels=["Low (0-1.5)", "Intermediate (2-6)", "High (>6)"])
+gc = pd.cut(geneva, [-np.inf, GENEVA_INT_GT, GENEVA_HIGH_GT, np.inf],
+            labels=["Low (0-3)", "Intermediate (4-10)", "High (>=11)"])
+cat_table = pd.DataFrame([cat_row(WELLS_NAME, l, g) for l, g in ser.groupby(wc, observed=False)]
+                         + [cat_row(GENEVA_NAME, l, g) for l, g in ser.groupby(gc, observed=False)])
+save_csv(cat_table, "Table2_score_categories_vs_PE_prevalence.csv")
+
+
+# ---- Table 3 / 3b: model + one operating point for Wells + one for Geneva
+def rule_row(y, s, gt, label):
+    r = threshold_row(y, (np.asarray(s) > gt).astype(int), 0.5, label)
+    r["Threshold"] = f"score>{gt:g}"
+    return r
+
+
+def build_threshold_table(y, mp, ws, gs, label):
+    y, mp, ws, gs = np.asarray(y), np.asarray(mp, float), np.asarray(ws, float), np.asarray(gs, float)
+    m = threshold_row(y, mp, PRIMARY_THRESHOLD, label)
+    m["Threshold"] = f"p>={PRIMARY_THRESHOLD:.2f}"
+    rows = [m, rule_row(y, ws, WELLS_TABLE_CUT, f"{WELLS_SHORT} >{WELLS_TABLE_CUT:g}"),
+            rule_row(y, gs, GENEVA_TABLE_CUT, f"{GENEVA_SHORT} >={GENEVA_TABLE_CUT + 1:g}")]
+    t = add_per1000(pd.DataFrame(rows), float(y.mean()))
+    t["AUC_continuous_(threshold-independent)"] = [roc_auc_score(y, mp), roc_auc_score(y, ws), roc_auc_score(y, gs)]
+    return t
+
+
+table3 = build_threshold_table(y_test_np, p_test, wells.loc[test_idx], geneva.loc[test_idx], "Elastic-net held-out")
+table3b = build_threshold_table(yv, oof_single, wells, geneva, "Elastic-net CV repeat 1")
+save_csv(table3, "Table3_held_out_threshold_vs_AUC.csv")
+save_csv(table3b, "Table3b_full_cohort_threshold_vs_AUC.csv")
+
+rep_h("Step 11 - Wells and Geneva: recomputation and comparison")
+rep_text("Wells = DVT signs 3, PE more likely than alternative diagnosis 3, HR>100 1.5, bedridden OR recent "
+         "surgery/immobilisation 1.5, previous PE/DVT 1.5, hemoptysis 1, malignancy 1; low 0-1.5, intermediate 2-6, "
+         "high >6. Geneva "
+         + ("was computed in full (Le Gal 2006)." if GENEVA_FULL else
+            "is a PARTIAL, exploratory score because age >=65, heart-rate bands (75-94 / >=95) and unilateral limb pain "
+            "were not recorded: previous PE/DVT 3, surgery 2, cancer 2, hemoptysis 2, tenderness AND whole-leg swelling 4, "
+            "HR>100 scored as 5. It must not be described as the validated Revised Geneva score."))
+rep_kv({"Item prevalence in PE (%)": 100 * alt[yv == 1].mean(), "Item prevalence in no-PE (%)": 100 * alt[yv == 0].mean(),
+        "Crude OR": alt_or, "Fisher p": alt_p, "Primary coding: Yes = PE more likely": ALT_ITEM_YES_MEANS_PE_MORE_LIKELY,
+        "Coding conflicts with data direction": CODING_CONFLICT,
+        "CV AUC per repeat, mean": float(np.mean(oof_auc)), "CV AUC per repeat, SD": float(np.std(oof_auc)),
+        "AUC of repeat-averaged OOF (supplementary, mildly optimistic)": roc_auc_score(yv, oof_avg)},
+       "Direction of the subjective Wells item")
+rep_text("A higher PE frequency when the item is 'Yes' only fits 'Yes = PE more likely'. Confirm the exact wording and "
+         "who recorded it; if the opposite meaning is confirmed, set ALT_ITEM_YES_MEANS_PE_MORE_LIKELY = False and "
+         "re-run. The item is also a model predictor and is a physician gestalt that may be recorded with knowledge of "
+         "imaging (information leakage): the 'no_alt_dx' scenario quantifies its effect on the model.")
+rep_df(pd.DataFrame([{"Component": c, "Overall_%": 100 * d[c].mean(), "PE_%": 100 * d.loc[y_all == 1, c].mean(),
+                      "NoPE_%": 100 * d.loc[y_all == 0, c].mean()}
+                     for c in ["evidence of a DVT", "PR>100", "Recently bedridden", "Recent surgery or immobilization",
+                               "Previous PE or DVT", "Hemoptysis", "Active cancer", ALT]]),
+       "Prevalence of each Wells component")
+rep_df(auc_table, "AUC with DeLong 95% CI")
+rep_df(dl, "Paired DeLong (model minus score), same patients",
+       note="Two comparators: interpret descriptively. Say 'numerically higher' when the CI includes 0.")
+rep_df(cat_table, "Table 2 - score categories vs observed PE prevalence")
+rep_df(table3, "Table 3 - held-out, threshold-dependent measures (AUC column is threshold-independent)")
+rep_df(table3b, "Table 3b - full cohort (rules fixed; model = one nested-CV repeat)")
+
+# ============================================================
+# 12. FINAL MODEL SPECIFICATION AND COEFFICIENT STABILITY
+# ============================================================
+
+
+def verify_and_save(model, columns, X, tag):
+    table, meta, b0, beta = extract_equation(model, columns)
+    diff = float(np.max(np.abs(expit(b0 + X[columns].to_numpy() @ beta) - predict_prob(model, X[columns]))))
+    meta["Max_abs_difference_vs_sklearn"] = diff
+    assert diff < 1e-6, "closed-form equation does not reproduce sklearn predictions"
+    save_csv(table.sort_values("Final_coef_original_0/1_coding", key=np.abs, ascending=False),
+             f"final_model_coefficients_{tag}.csv")
+    return table, meta, b0, beta
+
+
+tab_split, meta_split, _, _ = verify_and_save(split_models["primary"], base_columns,
+                                              df_analysis.loc[test_idx], "split_development")
+m_final, final_best, final_tab = fit_tuned_model(df_analysis[base_columns], y_all)
+save_csv(final_tab, "tuning_grid_final_full_cohort.csv")
+tab_final, meta_final, b0_final, beta_final = verify_and_save(m_final, base_columns, df_analysis, "full_cohort")
+meta_final.update({"Selected_C": final_best["C"], "Selected_l1_ratio": final_best["l1_ratio"]})
+save_csv(pd.DataFrame([meta_final]), "final_model_intercept_full_cohort.csv")
+save_txt("final_model_equation.json", json.dumps(
+    {"intercept": b0_final, "coefficients": dict(zip(base_columns, map(float, beta_final))),
+     "coding": "all predictors 0/1 (SEX: male=1); p = 1/(1+exp(-(intercept + sum(coef*x))))",
+     "hyperparameters": final_best, "status": "internally evaluated research prototype - not validated externally"},
+    indent=2, ensure_ascii=False))
+n_ret = int(tab_final["Retained_(non-zero)"].sum())
+print(f"Final model: intercept {b0_final:.4f}, retained {n_ret}/{len(base_columns)}, "
+      f"max |diff| vs sklearn {meta_final['Max_abs_difference_vs_sklearn']:.1e}")
+
+
+def _coef_boot(seed):
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(yv), len(yv))
+    try:
+        Xb = df_analysis[base_columns].iloc[idx].reset_index(drop=True)
+        m = build_calibrated_model((), final_best["C"], final_best["l1_ratio"]).fit(Xb, yv[idx])
+        return extract_equation(m, base_columns)[3]
+    except Exception:
+        return None
+
+
+cb = [b for b in Parallel(n_jobs=N_JOBS)(delayed(_coef_boot)(9000 + i) for i in range(N_BOOT_COEF)) if b is not None]
+cb = np.vstack(cb)
+coef_ci = pd.DataFrame({"Predictor": base_columns, "Coef": beta_final, "Boot_2.5%": np.percentile(cb, 2.5, axis=0),
+                        "Boot_97.5%": np.percentile(cb, 97.5, axis=0),
+                        "Sign_stability_%": 100 * np.maximum((cb > 0).mean(axis=0), (cb < 0).mean(axis=0))})
+coef_ci["CI_excludes_0"] = (coef_ci["Boot_2.5%"] > 0) | (coef_ci["Boot_97.5%"] < 0)
+coef_ci = coef_ci.reindex(coef_ci["Coef"].abs().sort_values(ascending=False).index)
+save_csv(coef_ci, "final_model_coefficient_bootstrap_CI.csv")
+save_csv(pd.DataFrame(cb, columns=base_columns), "coef_bootstrap_draws.csv")
+
+# worked example: one patient with several positive predictors
+cnt = df_analysis[base_columns].sum(axis=1)
+cand = df_analysis.index[(cnt >= 6) & (cnt <= 9)]
+ex_idx = cand[0] if len(cand) else df_analysis.index[0]
+xv = df_analysis.loc[ex_idx, base_columns].to_numpy(float)
+contrib = pd.DataFrame({"Predictor": base_columns, "x": xv, "beta": beta_final, "beta_x": beta_final * xv})
+contrib = contrib[contrib["x"] != 0]
+lp = b0_final + contrib["beta_x"].sum()
+save_txt("worked_example.txt", f"WORKED EXAMPLE (one patient)\nIntercept = {b0_final:.4f}\n"
+         + contrib.round(4).to_string(index=False) + f"\nLinear predictor = {lp:.4f}\nProbability = {expit(lp):.4f}\n")
+
+rep_h("Step 12 - Final model specification and coefficient stability")
+rep_text("Final model = refit on the full cohort after inner-CV tuning. Scaler, penalised regression and Platt sigmoid are "
+         "folded into ONE equation on the original 0/1 coding (verified to reproduce sklearn). Coefficients describe the "
+         "prediction function; they are not adjusted odds ratios. Bootstrap CIs refit the model with fixed "
+         f"hyper-parameters ({N_BOOT_COEF} resamples) and show how unstable individual coefficients are with "
+         f"{int(yv.sum())} events.")
+rep_kv(meta_final, "Final model: hyper-parameters, intercept, Platt parameters")
+rep_text(f"Effective penalty: l1_ratio = {final_best['l1_ratio']} -> "
+         + ("ridge (no coefficient shrunk to exactly zero); describe as 'elastic-net framework, tuning selected ridge'."
+            if final_best["l1_ratio"] == 0 else "elastic-net with some sparsity."))
+rep_df(coef_ci, f"Coefficients (0/1 coding, after Platt) with bootstrap CI; {n_ret} of {len(base_columns)} non-zero")
+rep_text("Closed-form equation:\n\n    logit(p) = " + f"{b0_final:+.4f} " + " ".join(
+    f"{b:+.4f}*[{n}]" for n, b in zip(base_columns, beta_final) if abs(b) > 1e-8))
+rep_kv(meta_split, "Development-split model (reproduces held-out results)")
+rep_text("Worked example:\n```text\n" + open(os.path.join(OUTPUT_DIR, "worked_example.txt"), encoding="utf-8").read()
+         + "\n```")
+
+# ---- optional internal-external validation (leave-one-centre-out)
+if CENTER_COLUMN and CENTER_COLUMN in df_analysis.columns:
+    grp = df_analysis[CENTER_COLUMN].astype(str)
+    ie_rows = []
+    for g in sorted(grp.unique()):
+        te, tr = (grp == g).to_numpy(), (grp != g).to_numpy()
+        if yv[te].sum() < 5 or (yv[te] == 0).sum() < 5:
+            continue
+        mg, _, _ = fit_tuned_model(df_analysis.loc[tr, base_columns], yv[tr])
+        pg = predict_prob(mg, df_analysis.loc[te, base_columns])
+        a, lo, hi = delong_ci_single(yv[te], pg)
+        sl, ci = cal_slope_citl(yv[te], pg)
+        ie_rows.append({"Held_out_centre": g, "N": int(te.sum()), "PE": int(yv[te].sum()), "AUC": a, "AUC_lo": lo,
+                        "AUC_hi": hi, "Cal_slope": sl, "CITL": ci})
+    ie = pd.DataFrame(ie_rows)
+    save_csv(ie, "internal_external_leave_one_centre_out.csv")
+    rep_h("Step 12b - Internal-external validation (leave-one-centre-out)")
+    rep_df(ie, "Performance in each centre when the model is developed in the other centres")
+
+# ============================================================
+# 13. CORRELATION AMONG PREDICTORS (supplement)
+# ============================================================
+phi = df_analysis[base_columns].corr(method="pearson")      # binary variables: Pearson r = phi
+save_csv(phi, "SUPPLEMENT_phi_correlation_matrix.csv", index=True)
+pairs = phi.where(np.triu(np.ones(phi.shape), 1).astype(bool)).stack().reset_index()
+pairs.columns = ["Var1", "Var2", "phi"]
+hi_pairs = pairs[pairs["phi"].abs() >= 0.30].sort_values("phi", key=np.abs, ascending=False)
+save_csv(hi_pairs, "SUPPLEMENT_phi_pairs_abs_ge_0.30.csv")
+rep_h("Step 13 - Correlation among binary predictors (supplement)")
+rep_text("All predictors are binary, so Pearson r equals the phi coefficient.")
+rep_df(hi_pairs, "Pairs with |phi| >= 0.30")
+plt.figure(figsize=(14, 12))
+sns.heatmap(phi, cmap="coolwarm", center=0, vmin=-1, vmax=1, square=True, cbar_kws={"label": "Phi coefficient"})
+plt.title("Phi correlation between binary predictors (supplementary)")
+save_fig("SUPPLEMENT_phi_heatmap.png", 300)
+
+# ============================================================
+# 14. FIGURES
+# ============================================================
+auc_m_test, auc_m_oof = roc_auc_score(y_test_np, p_test), roc_auc_score(yv, oof_single)
+
+# ROC, held-out
+plt.figure(figsize=(7, 6.5))
+for lab, s in [("Elastic-net", p_test), (WELLS_SHORT, wells.loc[test_idx].to_numpy()),
+               (GENEVA_SHORT, geneva.loc[test_idx].to_numpy())]:
+    f_, t_, _ = roc_curve(y_test_np, s)
+    plt.plot(f_, t_, lw=2.2, label=f"{lab}, AUC={roc_auc_score(y_test_np, s):.3f}")
+plt.plot([0, 1], [0, 1], "k--", label="No discrimination")
+plt.xlabel("1 - Specificity"); plt.ylabel("Sensitivity"); plt.title("ROC curves, same held-out patients")
+plt.legend(loc="lower right", fontsize=9)
+save_fig("Figure_ROC_heldout.png")
+
+# ROC, full cohort (model = out-of-fold)
+plt.figure(figsize=(7, 6.5))
+for lab, s in [("Elastic-net (nested-CV out-of-fold)", oof_single), (WELLS_SHORT, wells.to_numpy()),
+               (GENEVA_SHORT, geneva.to_numpy())]:
+    f_, t_, _ = roc_curve(yv, s)
+    plt.plot(f_, t_, lw=2.2, label=f"{lab}, AUC={roc_auc_score(yv, s):.3f}")
+plt.plot([0, 1], [0, 1], "k--", label="No discrimination")
+plt.xlabel("1 - Specificity"); plt.ylabel("Sensitivity"); plt.title(f"ROC curves, full cohort (n={len(yv)})")
+plt.legend(loc="lower right", fontsize=9)
+save_fig("Figure_ROC_full_cohort.png")
+
+# Calibration (held-out + full-cohort OOF) with exact CIs
+cal_h, cal_f = binned_calibration(y_test_np, p_test, 5), binned_calibration(yv, oof_single, 10)
+save_csv(cal_h, "calibration_bins_heldout.csv")
+save_csv(cal_f, "calibration_bins_full_cohort_oof.csv")
+fig, axs = plt.subplots(1, 2, figsize=(12, 5.6))
+for ax, tb, ttl in [(axs[0], cal_h, f"Held-out set (n={len(y_test_np)}, 5 quantile bins)"),
+                    (axs[1], cal_f, f"Full cohort, out-of-fold (n={len(yv)}, 10 quantile bins)")]:
+    ax.errorbar(tb["Mean_predicted"], tb["Observed"],
+                yerr=[tb["Observed"] - tb["CI_lo"], tb["CI_hi"] - tb["Observed"]],
+                fmt="o-", capsize=3, lw=1.8, label="Elastic-net (exact 95% CI)")
+    ax.plot([0, 1], [0, 1], "k--", label="Perfect calibration")
+    ax.set_xlim(0, max(0.8, tb["CI_hi"].max())); ax.set_ylim(0, max(0.8, tb["CI_hi"].max()))
+    ax.set_xlabel("Mean predicted probability"); ax.set_ylabel("Observed proportion with PE"); ax.set_title(ttl)
+    ax.legend(loc="upper left", fontsize=8)
+save_fig("Figure_calibration.png")
+
+# Confusion matrix
+plt.figure(figsize=(5.5, 4.5))
+sns.heatmap(confusion_matrix(y_test, (p_test >= PRIMARY_THRESHOLD).astype(int), labels=[0, 1]), annot=True, fmt="d",
+            cmap="Blues", cbar=False, xticklabels=["Predicted non-PE", "Predicted PE"],
+            yticklabels=["CTPA non-PE", "CTPA PE"])
+plt.title(f"Held-out confusion matrix, threshold {PRIMARY_THRESHOLD:.2f}")
+save_fig("Figure_confusion_matrix.png")
+
+# Coefficients with bootstrap CI
+cp = coef_ci.head(15).sort_values("Coef")
+plt.figure(figsize=(9.5, 6.8))
+plt.barh(cp["Predictor"], cp["Coef"], color=["firebrick" if v > 0 else "steelblue" for v in cp["Coef"]], alpha=0.85)
+plt.errorbar(cp["Coef"], cp["Predictor"], xerr=[cp["Coef"] - cp["Boot_2.5%"], cp["Boot_97.5%"] - cp["Coef"]],
+             fmt="none", ecolor="black", capsize=2, lw=1)
+plt.axvline(0, color="k", lw=1)
+plt.xlabel("Log-odds coefficient (0/1 coding, after Platt) with bootstrap 95% CI")
+plt.title("15 largest coefficients, final model")
+save_fig("Figure_coefficients.png")
+
+# Risk distribution
+plt.figure(figsize=(7.5, 5))
+for lab, v, c in [("No PE", oof_single[yv == 0], "steelblue"), ("PE", oof_single[yv == 1], "firebrick")]:
+    plt.hist(v, bins=np.linspace(0, 1, 26), alpha=0.6, label=f"{lab} (n={len(v)})", color=c)
+plt.axvline(PRIMARY_THRESHOLD, color="k", ls="--", label=f"Threshold {PRIMARY_THRESHOLD:.2f}")
+plt.xlabel("Out-of-fold predicted probability of PE"); plt.ylabel("Patients")
+plt.title("Distribution of predicted risk (full cohort)")
+plt.legend()
+save_fig("Figure_risk_distribution.png")
+
+# Decision curves (held-out + full-cohort OOF)
+ths = np.arange(0.01, 0.91, 0.01)
+fig, axs = plt.subplots(1, 2, figsize=(12.5, 5.2))
+dc_rows = {}
+for ax, (y_, p_, ttl) in zip(axs, [(y_test_np, p_test, "Held-out set"), (yv, oof_single, "Full cohort, out-of-fold")]):
+    nbm, nba = net_benefit(y_, p_, ths)
+    ax.plot(ths, nbm, lw=2, label="Elastic-net"); ax.plot(ths, nba, "--", lw=2, label="Refer all")
+    ax.axhline(0, ls=":", color="k", label="Refer none"); ax.set_ylim(-0.1, max(nba) + 0.05)
+    ax.set_xlabel("Risk threshold"); ax.set_ylabel("Net benefit")
+    ax.set_title(f"Decision curve (exploratory) - {ttl}"); ax.legend()
+    dc_rows[ttl] = pd.DataFrame({"Threshold": ths, "NB_model": nbm, "NB_refer_all": nba})
+save_csv(dc_rows["Held-out set"], "decision_curve_heldout.csv")
+save_csv(dc_rows["Full cohort, out-of-fold"], "decision_curve_full_oof.csv")
+save_fig("Figure_decision_curve.png")
+
+
+def draw_boxes(items, fname, title, size, gap, top, width=0.72, height=0.07):
+    fig, ax = plt.subplots(figsize=size)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
+    for i, (txt, col) in enumerate(items):
+        y0 = top - i * gap
+        ax.add_patch(FancyBboxPatch((0.5 - width / 2, y0 - height / 2), width, height, boxstyle="round,pad=0.012",
+                                    ec="black", fc=col, lw=1.2))
+        ax.text(0.5, y0, txt, ha="center", va="center", fontsize=10)
+        if i < len(items) - 1:
+            ax.annotate("", xy=(0.5, y0 - gap + height / 2), xytext=(0.5, y0 - height / 2),
+                        arrowprops=dict(arrowstyle="->", lw=1.3))
+    ax.text(0.5, 0.995, title, ha="center", va="top", fontsize=14, fontweight="bold")
+    save_fig(fname)
+
+
+nz = lambda v: "not recorded" if v is None else f"{v}"
+draw_boxes([
+    (f"Patients assessed for suspected PE\nn = {nz(N_ASSESSED_SUSPECTED_PE)}", "#DCEAF7"),
+    (f"Patients undergoing CTPA\nn = {nz(N_UNDERWENT_CTPA)}", "#DCEAF7"),
+    (f"Records in the study file\nn = {N_ROWS_IN_FILE}", "#DCEAF7"),
+    (f"Excluded: missing / unrecognised essential data\nn = {n_excl_missing}"
+     + (f"\n{EXCLUSION_REASONS_TEXT}" if EXCLUSION_REASONS_TEXT else ""), "#FCE4D6"),
+    (f"Analytic cohort (complete cases)\nn = {len(df_analysis)}", "#E8F3E8"),
+    (f"CTPA-confirmed PE n = {int(yv.sum())}  |  No PE n = {int((yv == 0).sum())}", "#E8F3E8"),
+    (f"Development (70%) n = {len(train_idx)}, PE {int(y_train.sum())}  |  "
+     f"Held-out (30%) n = {len(test_idx)}, PE {int(y_test.sum())}", "#FFF2CC")],
+    "Figure_participant_flow.png", "Participant flow", (10, 11), 0.135, 0.90, width=0.85, height=0.085)
+
+# ============================================================
+# DONE
+# ============================================================
+print("\n" + "=" * 70 + "\nANALYSIS COMPLETED. Outputs in:", OUTPUT_DIR, "\n" + "=" * 70)
+_RUN_COMPLETE = True
+save_report()
